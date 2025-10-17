@@ -25,6 +25,8 @@ from typing import List, Tuple
 import numpy as np
 import fitz  # PyMuPDF
 import cv2
+import re
+import unicodedata
 
 try:
     from paddleocr import PaddleOCR
@@ -88,6 +90,122 @@ def run_ocr_pdf(pdf_path: str, lang: str = "latin", dpi: int = 200, use_gpu: boo
                 print(line)
         else:
             print("[AVISO] No se reconoció texto en esta página.")
+
+# --- NUEVAS FUNCIONES: primera página y radicado ---
+
+def extract_text_first_page(ocr: PaddleOCR, pdf_path: str, dpi: int = 200) -> str:
+    doc = fitz.open(pdf_path)
+    if doc.page_count == 0:
+        return ""
+    page = doc.load_page(0)
+    img_bgr = pdf_page_to_bgr(page, dpi=dpi)
+    texts = ocr_image_bgr(ocr, img_bgr)
+    return "\n".join(texts or [])
+
+
+def _normalize_text(s: str) -> str:
+    try:
+        s_norm = unicodedata.normalize("NFD", s)
+        s_no_accents = "".join(c for c in s_norm if unicodedata.category(c) != "Mn")
+        return s_no_accents
+    except Exception:
+        return s
+
+
+def find_radicado_number(text: str) -> str | None:
+    """Intenta extraer el número de radicación/registrado desde el texto OCR.
+    - Busca patrones como 'Radicación: 20201340001646' o 'Radicado No. 20201340001646'.
+    - Acepta separadores espacios, guiones o puntos.
+    - Devuelve sólo dígitos; requiere longitud mínima de 12.
+    """
+    candidates: list[str] = []
+    patterns = [
+        r"(?i)radicaci[oó]n\s*(?:n[oº]\.?|no\.?|numero|#|num\.?)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
+        r"(?i)radicado\s*(?:n[oº]\.?|no\.?|numero|#|num\.?)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            candidates.append(m.group(1))
+
+    # Fallback: tomar dígitos dentro de 100 caracteres después de 'radica...'
+    for m in re.finditer(r"(?i)radicaci[oó]n|radicado", text):
+        segment = text[m.end(): m.end() + 100]
+        m2 = re.search(r"([0-9][\d\-\.\s]{8,})", segment)
+        if m2:
+            candidates.append(m2.group(1))
+
+    # Normalizar candidatos: conservar sólo dígitos
+    for cand in candidates:
+        digits = re.sub(r"\D", "", cand)
+        if len(digits) >= 12:
+            return digits
+
+    # Último recurso: escoger la secuencia de dígitos más larga en todo el texto si >= 13
+    longest = ""
+    for m in re.finditer(r"(\d{12,})", _normalize_text(text)):
+        if len(m.group(1)) > len(longest):
+            longest = m.group(1)
+    if len(longest) >= 13:
+        return longest
+    return None
+
+
+def process_predial_rename(dir_path: str, lang: str = "en", dpi: int = 300) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """
+    Busca 'predial' en la PRIMERA página y extrae el número de radicación.
+    Si se encuentra, renombra el archivo a 'predial_{numero}.pdf' en el mismo directorio.
+
+    Devuelve (renamed, skipped) donde:
+    - renamed: lista de tuplas (src, dst) con archivos renombrados
+    - skipped: lista de tuplas (src, motivo) para los que no se renombraron
+    """
+    if not os.path.isdir(dir_path):
+        raise FileNotFoundError(f"Directorio no encontrado: {dir_path}")
+
+    print(f"[INFO] Inicializando PaddleOCR para renombrar por 'predial' (lang={lang})...")
+    ocr = PaddleOCR(use_textline_orientation=True, lang=lang)
+
+    renamed: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = []
+
+    pdf_files = [f for f in os.listdir(dir_path) if f.lower().endswith(".pdf")]
+    if not pdf_files:
+        print("[AVISO] No se encontraron archivos PDF en el directorio.")
+
+    for filename in sorted(pdf_files):
+        src_path = os.path.join(dir_path, filename)
+        print(f"[INFO] Analizando primera página: {src_path}")
+        try:
+            page_text = extract_text_first_page(ocr, src_path, dpi=dpi)
+        except Exception as e:
+            print(f"[ERROR] Falló OCR en primera página para {src_path}: {e}")
+            skipped.append((src_path, "error_ocr"))
+            continue
+
+        text_lower = _normalize_text(page_text).lower()
+        if "predial" not in text_lower:
+            print("[INFO] No contiene 'predial' en la primera página; se omite.")
+            skipped.append((src_path, "no_predial"))
+            continue
+
+        radicado = find_radicado_number(page_text)
+        if not radicado:
+            print("[AVISO] 'predial' encontrado pero no se detectó número de radicación; se omite.")
+            skipped.append((src_path, "sin_radicado"))
+            continue
+
+        new_filename = f"predial_{radicado}.pdf"
+        dst_path = ensure_unique_path(dir_path, new_filename)
+        try:
+            shutil.move(src_path, dst_path)
+            print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {os.path.basename(dst_path)}")
+            renamed.append((src_path, dst_path))
+        except Exception as e:
+            print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+            skipped.append((src_path, "error_renombrar"))
+
+    return renamed, skipped
 
 def extract_text_from_pdf(ocr: PaddleOCR, pdf_path: str, dpi: int = 200) -> str:
     """Extrae texto de todo el PDF usando OCR y devuelve un único string."""
@@ -171,13 +289,27 @@ def parse_args():
     parser.add_argument("--gpu", action="store_true", help="Usar GPU si está disponible")
     parser.add_argument("--keyword", default="sentencia", help="Palabra/frase a buscar en el texto OCR (modo carpeta)")
     parser.add_argument("--out-dir", default=None, help="Carpeta destino para mover coincidencias (por defecto '<dir>/procesados')")
+    parser.add_argument("--predial-rename", action="store_true", help="Buscar 'predial' en la primera página y renombrar a predial_{numero}.pdf")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     try:
-        if args.dir:
+        if getattr(args, "predial_rename", False) and args.dir:
+            renamed, skipped = process_predial_rename(
+                dir_path=args.dir,
+                lang=args.lang,
+                dpi=args.dpi,
+            )
+            print("\n===== Resumen (Predial-Renombrar) =====")
+            print(f"Renombrados ({len(renamed)}):")
+            for src, dst in renamed:
+                print(f" - {os.path.basename(src)} -> {os.path.basename(dst)}")
+            print(f"Omitidos ({len(skipped)}):")
+            for src, motivo in skipped:
+                print(f" - {os.path.basename(src)} ({motivo})")
+        elif args.dir:
             moved, not_moved = process_directory(
                 dir_path=args.dir,
                 keyword=args.keyword,
