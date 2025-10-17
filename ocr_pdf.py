@@ -113,48 +113,80 @@ def _normalize_text(s: str) -> str:
 
 
 def find_radicado_number(text: str) -> str | None:
-    """Intenta extraer el número de radicación/registrado desde el texto OCR.
-    - Busca patrones como 'Radicación: 20201340001646' o 'Radicado No. 20201340001646'.
-    - Acepta separadores espacios, guiones o puntos.
-    - Devuelve sólo dígitos; requiere longitud mínima de 12.
+    """
+    Extrae un identificador priorizando números de 'Factura' cuando el documento es predial.
+    Orden de prioridad:
+    1) Factura (p. ej., 'Factura Oficial No.: 20201340023139')
+    2) Radicación/Radicado
+    3) Referencia del Predio
+    4) Secuencia de dígitos más larga (>=12) como último recurso.
+    Devuelve sólo dígitos.
     """
     candidates: list[str] = []
-    patterns = [
-        r"(?i)radicaci[oó]n\s*(?:n[oº]\.?|no\.?|numero|#|num\.?)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
-        r"(?i)radicado\s*(?:n[oº]\.?|no\.?|numero|#|num\.?)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
+
+    # --- 1) FACTURA ---
+    patterns_factura = [
+        r"(?i)factura(?:\s*oficial)?\s*(?:n[oº]\.?|no\.?|numero|num\.?|#)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
     ]
-    for pat in patterns:
+    for pat in patterns_factura:
         m = re.search(pat, text)
         if m:
             candidates.append(m.group(1))
-
-    # Fallback: tomar dígitos dentro de 100 caracteres después de 'radica...'
-    for m in re.finditer(r"(?i)radicaci[oó]n|radicado", text):
-        segment = text[m.end(): m.end() + 100]
+    for m in re.finditer(r"(?i)factura", text):
+        segment = text[m.end(): m.end() + 120]
         m2 = re.search(r"([0-9][\d\-\.\s]{8,})", segment)
         if m2:
             candidates.append(m2.group(1))
 
-    # Normalizar candidatos: conservar sólo dígitos
+    # --- 2) RADICACIÓN/RADICADO ---
+    patterns_radicado = [
+        r"(?i)radicaci[oó]n\s*(?:n[oº]\.?|no\.?|numero|#|num\.?)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
+        r"(?i)radicado\s*(?:n[oº]\.?|no\.?|numero|#|num\.?)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
+    ]
+    for pat in patterns_radicado:
+        m = re.search(pat, text)
+        if m:
+            candidates.append(m.group(1))
+    for m in re.finditer(r"(?i)radicaci[oó]n|radicado", text):
+        segment = text[m.end(): m.end() + 120]
+        m2 = re.search(r"([0-9][\d\-\.\s]{8,})", segment)
+        if m2:
+            candidates.append(m2.group(1))
+
+    # --- 3) REFERENCIA DEL PREDIO ---
+    patterns_ref = [
+        r"(?i)referencia\s*(?:del\s*predio|predio)\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
+    ]
+    for pat in patterns_ref:
+        m = re.search(pat, text)
+        if m:
+            candidates.append(m.group(1))
+    for m in re.finditer(r"(?i)referencia\s*(?:del\s*predio|predio)", text):
+        segment = text[m.end(): m.end() + 120]
+        m2 = re.search(r"([0-9][\d\-\.\s]{8,})", segment)
+        if m2:
+            candidates.append(m2.group(1))
+
+    # --- Normalizar y decidir ---
     for cand in candidates:
         digits = re.sub(r"\D", "", cand)
         if len(digits) >= 12:
             return digits
 
-    # Último recurso: escoger la secuencia de dígitos más larga en todo el texto si >= 13
+    # Último recurso: escoger la secuencia de dígitos más larga en todo el texto si >= 12
     longest = ""
     for m in re.finditer(r"(\d{12,})", _normalize_text(text)):
         if len(m.group(1)) > len(longest):
             longest = m.group(1)
-    if len(longest) >= 13:
+    if len(longest) >= 12:
         return longest
     return None
 
 
-def process_predial_rename(dir_path: str, lang: str = "en", dpi: int = 300) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+def process_predial_rename(dir_path: str, lang: str = "en", dpi: int = 300, out_dir: str | None = None) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """
-    Busca 'predial' en la PRIMERA página y extrae el número de radicación.
-    Si se encuentra, renombra el archivo a 'predial_{numero}.pdf' en el mismo directorio.
+    Busca 'predial' en la PRIMERA página y extrae el número (priorizando 'Factura').
+    Si se encuentra, renombra el archivo a 'predial_{numero}.pdf' y lo mueve a out_dir.
 
     Devuelve (renamed, skipped) donde:
     - renamed: lista de tuplas (src, dst) con archivos renombrados
@@ -162,6 +194,10 @@ def process_predial_rename(dir_path: str, lang: str = "en", dpi: int = 300) -> t
     """
     if not os.path.isdir(dir_path):
         raise FileNotFoundError(f"Directorio no encontrado: {dir_path}")
+
+    if out_dir is None:
+        out_dir = os.path.join(dir_path, "predial")
+    os.makedirs(out_dir, exist_ok=True)
 
     print(f"[INFO] Inicializando PaddleOCR para renombrar por 'predial' (lang={lang})...")
     ocr = PaddleOCR(use_textline_orientation=True, lang=lang)
@@ -189,20 +225,20 @@ def process_predial_rename(dir_path: str, lang: str = "en", dpi: int = 300) -> t
             skipped.append((src_path, "no_predial"))
             continue
 
-        radicado = find_radicado_number(page_text)
-        if not radicado:
-            print("[AVISO] 'predial' encontrado pero no se detectó número de radicación; se omite.")
-            skipped.append((src_path, "sin_radicado"))
+        numero = find_radicado_number(page_text)
+        if not numero:
+            print("[AVISO] 'predial' encontrado pero no se detectó número (Factura/Radicado/Referencia); se omite.")
+            skipped.append((src_path, "sin_numero"))
             continue
 
-        new_filename = f"predial_{radicado}.pdf"
-        dst_path = ensure_unique_path(dir_path, new_filename)
+        new_filename = f"predial_{numero}.pdf"
+        dst_path = ensure_unique_path(out_dir, new_filename)
         try:
             shutil.move(src_path, dst_path)
-            print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {os.path.basename(dst_path)}")
+            print(f"[OK] Renombrado y movido: {os.path.basename(src_path)} -> {dst_path}")
             renamed.append((src_path, dst_path))
         except Exception as e:
-            print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+            print(f"[ERROR] No se pudo renombrar/mover {src_path} -> {dst_path}: {e}")
             skipped.append((src_path, "error_renombrar"))
 
     return renamed, skipped
@@ -290,6 +326,7 @@ def parse_args():
     parser.add_argument("--keyword", default="sentencia", help="Palabra/frase a buscar en el texto OCR (modo carpeta)")
     parser.add_argument("--out-dir", default=None, help="Carpeta destino para mover coincidencias (por defecto '<dir>/procesados')")
     parser.add_argument("--predial-rename", action="store_true", help="Buscar 'predial' en la primera página y renombrar a predial_{numero}.pdf")
+    parser.add_argument("--predial-out-dir", default=None, help="Carpeta destino para renombrados del modo predial (por defecto '<dir>/predial')")
     return parser.parse_args()
 
 
@@ -301,6 +338,7 @@ if __name__ == "__main__":
                 dir_path=args.dir,
                 lang=args.lang,
                 dpi=args.dpi,
+                out_dir=args.predial_out_dir,
             )
             print("\n===== Resumen (Predial-Renombrar) =====")
             print(f"Renombrados ({len(renamed)}):")
