@@ -49,26 +49,31 @@ def pdf_page_to_bgr(page: fitz.Page, dpi: int = 200) -> np.ndarray:
     return img_bgr
 
 
-def ocr_image_bgr(ocr: PaddleOCR, img_bgr: np.ndarray) -> List[str]:
+def ocr_image_bgr(ocr: PaddleOCR, img_bgr: np.ndarray, min_rec_score: float = 0.0) -> List[str]:
     """Aplica OCR y devuelve una lista de textos reconocidos en la imagen.
 
     En PaddleOCR 3.x se usa `predict` y el resultado contiene claves como 'rec_texts'.
+    Si `min_rec_score` > 0, filtra por el puntaje de reconocimiento para intentar
+    ignorar trazos manuscritos o resultados poco confiables.
     """
     result = ocr.predict(img_bgr)
     texts: List[str] = []
     if not result:
         return texts
-    # `predict` devuelve una lista de resultados; tomamos el primero.
     res0 = result[0]
-    # La salida típica incluye 'rec_texts' con las cadenas reconocidas.
     if isinstance(res0, dict) and 'rec_texts' in res0:
-        for txt in res0['rec_texts'] or []:
-            if isinstance(txt, str):
-                texts.append(txt)
+        rec_texts = res0.get('rec_texts') or []
+        rec_scores = res0.get('rec_scores') or [1.0] * len(rec_texts)
+        for t, s in zip(rec_texts, rec_scores):
+            if not isinstance(t, str):
+                continue
+            if min_rec_score and s < float(min_rec_score):
+                continue
+            texts.append(t)
     return texts
 
 
-def run_ocr_pdf(pdf_path: str, lang: str = "latin", dpi: int = 200, use_gpu: bool = False):
+def run_ocr_pdf(pdf_path: str, lang: str = "latin", dpi: int = 300, use_gpu: bool = False):
     if not os.path.isfile(pdf_path):
         print(f"[ERROR] Archivo no encontrado: {pdf_path}")
         sys.exit(1)
@@ -93,164 +98,24 @@ def run_ocr_pdf(pdf_path: str, lang: str = "latin", dpi: int = 200, use_gpu: boo
 
 # --- NUEVAS FUNCIONES: primera página y radicado ---
 
-def extract_text_first_page(ocr: PaddleOCR, pdf_path: str, dpi: int = 200) -> str:
+def extract_text_first_page(ocr: PaddleOCR, pdf_path: str, dpi: int = 200, min_score: float = 0.0) -> str:
     doc = fitz.open(pdf_path)
     if doc.page_count == 0:
         return ""
     page = doc.load_page(0)
     img_bgr = pdf_page_to_bgr(page, dpi=dpi)
-    texts = ocr_image_bgr(ocr, img_bgr)
+    texts = ocr_image_bgr(ocr, img_bgr, min_rec_score=min_score)
     return "\n".join(texts or [])
 
 
-def _normalize_text(s: str) -> str:
-    try:
-        s_norm = unicodedata.normalize("NFD", s)
-        s_no_accents = "".join(c for c in s_norm if unicodedata.category(c) != "Mn")
-        return s_no_accents
-    except Exception:
-        return s
-
-
-def find_radicado_number(text: str) -> str | None:
-    """
-    Extrae un identificador priorizando números de 'Factura' cuando el documento es predial.
-    Orden de prioridad:
-    1) Factura (p. ej., 'Factura Oficial No.: 20201340023139')
-    2) Radicación/Radicado
-    3) Referencia del Predio
-    4) Secuencia de dígitos más larga (>=12) como último recurso.
-    Devuelve sólo dígitos.
-    """
-    candidates: list[str] = []
-
-    # --- 1) FACTURA ---
-    patterns_factura = [
-        r"(?i)factura(?:\s*oficial)?\s*(?:n[oº]\.?|no\.?|numero|num\.?|#)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
-    ]
-    for pat in patterns_factura:
-        m = re.search(pat, text)
-        if m:
-            candidates.append(m.group(1))
-    for m in re.finditer(r"(?i)factura", text):
-        segment = text[m.end(): m.end() + 120]
-        m2 = re.search(r"([0-9][\d\-\.\s]{8,})", segment)
-        if m2:
-            candidates.append(m2.group(1))
-
-    # --- 2) RADICACIÓN/RADICADO ---
-    patterns_radicado = [
-        r"(?i)radicaci[oó]n\s*(?:n[oº]\.?|no\.?|numero|#|num\.?)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
-        r"(?i)radicado\s*(?:n[oº]\.?|no\.?|numero|#|num\.?)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
-    ]
-    for pat in patterns_radicado:
-        m = re.search(pat, text)
-        if m:
-            candidates.append(m.group(1))
-    for m in re.finditer(r"(?i)radicaci[oó]n|radicado", text):
-        segment = text[m.end(): m.end() + 120]
-        m2 = re.search(r"([0-9][\d\-\.\s]{8,})", segment)
-        if m2:
-            candidates.append(m2.group(1))
-
-    # --- 3) REFERENCIA DEL PREDIO ---
-    patterns_ref = [
-        r"(?i)referencia\s*(?:del\s*predio|predio)\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})",
-    ]
-    for pat in patterns_ref:
-        m = re.search(pat, text)
-        if m:
-            candidates.append(m.group(1))
-    for m in re.finditer(r"(?i)referencia\s*(?:del\s*predio|predio)", text):
-        segment = text[m.end(): m.end() + 120]
-        m2 = re.search(r"([0-9][\d\-\.\s]{8,})", segment)
-        if m2:
-            candidates.append(m2.group(1))
-
-    # --- Normalizar y decidir ---
-    for cand in candidates:
-        digits = re.sub(r"\D", "", cand)
-        if len(digits) >= 12:
-            return digits
-
-    # Último recurso: escoger la secuencia de dígitos más larga en todo el texto si >= 12
-    longest = ""
-    for m in re.finditer(r"(\d{12,})", _normalize_text(text)):
-        if len(m.group(1)) > len(longest):
-            longest = m.group(1)
-    if len(longest) >= 12:
-        return longest
-    return None
-
-
-def process_predial_rename(dir_path: str, lang: str = "en", dpi: int = 300, out_dir: str | None = None) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-    """
-    Busca 'predial' en la PRIMERA página y extrae el número (priorizando 'Factura').
-    Si se encuentra, renombra el archivo a 'predial_{numero}.pdf' y lo mueve a out_dir.
-
-    Devuelve (renamed, skipped) donde:
-    - renamed: lista de tuplas (src, dst) con archivos renombrados
-    - skipped: lista de tuplas (src, motivo) para los que no se renombraron
-    """
-    if not os.path.isdir(dir_path):
-        raise FileNotFoundError(f"Directorio no encontrado: {dir_path}")
-
-    if out_dir is None:
-        out_dir = os.path.join(dir_path, "predial")
-    os.makedirs(out_dir, exist_ok=True)
-
-    print(f"[INFO] Inicializando PaddleOCR para renombrar por 'predial' (lang={lang})...")
-    ocr = PaddleOCR(use_textline_orientation=True, lang=lang)
-
-    renamed: list[tuple[str, str]] = []
-    skipped: list[tuple[str, str]] = []
-
-    pdf_files = [f for f in os.listdir(dir_path) if f.lower().endswith(".pdf")]
-    if not pdf_files:
-        print("[AVISO] No se encontraron archivos PDF en el directorio.")
-
-    for filename in sorted(pdf_files):
-        src_path = os.path.join(dir_path, filename)
-        print(f"[INFO] Analizando primera página: {src_path}")
-        try:
-            page_text = extract_text_first_page(ocr, src_path, dpi=dpi)
-        except Exception as e:
-            print(f"[ERROR] Falló OCR en primera página para {src_path}: {e}")
-            skipped.append((src_path, "error_ocr"))
-            continue
-
-        text_lower = _normalize_text(page_text).lower()
-        if "predial" not in text_lower:
-            print("[INFO] No contiene 'predial' en la primera página; se omite.")
-            skipped.append((src_path, "no_predial"))
-            continue
-
-        numero = find_radicado_number(page_text)
-        if not numero:
-            print("[AVISO] 'predial' encontrado pero no se detectó número (Factura/Radicado/Referencia); se omite.")
-            skipped.append((src_path, "sin_numero"))
-            continue
-
-        new_filename = f"predial_{numero}.pdf"
-        dst_path = ensure_unique_path(out_dir, new_filename)
-        try:
-            shutil.move(src_path, dst_path)
-            print(f"[OK] Renombrado y movido: {os.path.basename(src_path)} -> {dst_path}")
-            renamed.append((src_path, dst_path))
-        except Exception as e:
-            print(f"[ERROR] No se pudo renombrar/mover {src_path} -> {dst_path}: {e}")
-            skipped.append((src_path, "error_renombrar"))
-
-    return renamed, skipped
-
-def extract_text_from_pdf(ocr: PaddleOCR, pdf_path: str, dpi: int = 200) -> str:
+def extract_text_from_pdf(ocr: PaddleOCR, pdf_path: str, dpi: int = 200, min_score: float = 0.0) -> str:
     """Extrae texto de todo el PDF usando OCR y devuelve un único string."""
     doc = fitz.open(pdf_path)
     all_texts: List[str] = []
     for page_index in range(doc.page_count):
         page = doc.load_page(page_index)
         img_bgr = pdf_page_to_bgr(page, dpi=dpi)
-        texts = ocr_image_bgr(ocr, img_bgr)
+        texts = ocr_image_bgr(ocr, img_bgr, min_rec_score=min_score)
         if texts:
             all_texts.extend(texts)
     return "\n".join(all_texts)
@@ -320,13 +185,14 @@ def parse_args():
     parser = argparse.ArgumentParser(description="OCR de PDF con PaddleOCR")
     parser.add_argument("--pdf", required=False, help="Ruta al archivo PDF")
     parser.add_argument("--dir", required=False, help="Directorio con archivos PDF a procesar")
-    parser.add_argument("--lang", default="en", help="Idioma del modelo (ej. 'en', 'ch')")
+    parser.add_argument("--lang", default="en", help="Idioma del modelo (ej. 'en', 'ch', 'latin')")
     parser.add_argument("--dpi", type=int, default=200, help="Resolución de rasterizado de las páginas")
     parser.add_argument("--gpu", action="store_true", help="Usar GPU si está disponible")
     parser.add_argument("--keyword", default="sentencia", help="Palabra/frase a buscar en el texto OCR (modo carpeta)")
     parser.add_argument("--out-dir", default=None, help="Carpeta destino para mover coincidencias (por defecto '<dir>/procesados')")
     parser.add_argument("--predial-rename", action="store_true", help="Buscar 'predial' en la primera página y renombrar a predial_{numero}.pdf")
     parser.add_argument("--predial-out-dir", default=None, help="Carpeta destino para renombrados del modo predial (por defecto '<dir>/predial')")
+    parser.add_argument("--min-score", type=float, default=0.0, help="Puntaje mínimo de reconocimiento para filtrar líneas (ej. 0.8 para ignorar manuscritos)")
     return parser.parse_args()
 
 
@@ -339,6 +205,7 @@ if __name__ == "__main__":
                 lang=args.lang,
                 dpi=args.dpi,
                 out_dir=args.predial_out_dir,
+                min_score=args.min_score,
             )
             print("\n===== Resumen (Predial-Renombrar) =====")
             print(f"Renombrados ({len(renamed)}):")
