@@ -320,6 +320,44 @@ def find_expediente_number(text: str) -> str | None:
     return None
 
 
+def find_invoice_number(text: str) -> str | None:
+    """
+    Extrae número de 'Factura'. Devuelve dígitos si longitud >= 6.
+    Acepta variaciones: "Factura No", "Nº", "Numero", "Num.", "#".
+    """
+    norm = _normalize_text(text)
+    patterns_invoice = [
+        r"(?i)factura\s*(?:n[oº]\.??|no\.?|numero|#|num\.?)?\s*[:\-]?\s*([0-9][\d\-\.\s]{5,})",
+    ]
+    for pat in patterns_invoice:
+        m = re.search(pat, norm)
+        if m:
+            digits = re.sub(r"\D", "", m.group(1))
+            if len(digits) >= 6:
+                return digits
+    # búsqueda cercana tras la palabra 'Factura'
+    for m in re.finditer(r"(?i)factura", norm):
+        segment = norm[m.end(): m.end() + 120]
+        m2 = re.search(r"([0-9][\d\-\.\s]{5,})", segment)
+        if m2:
+            digits = re.sub(r"\D", "", m2.group(1))
+            if len(digits) >= 6:
+                return digits
+    return None
+
+
+def is_cartelera_hint(text: str) -> bool:
+    norm = _normalize_text(text).lower()
+    has_radicado = bool(re.search(r"(?i)radicaci[oó]n|radicado", norm))
+    if "carteler" in norm:
+        return True
+    hints = 0
+    for token in ["publique", "publicese", "circular", "certifico", "alcaldia"]:
+        if token in norm:
+            hints += 1
+    return has_radicado and hints >= 2
+
+
 def process_classify_rename(
     dir_path: str,
     lang: str = "latin",
@@ -379,8 +417,32 @@ def process_classify_rename(
         category = None
         number = None
 
-        # Prioridad de categorías para evitar colisiones
-        if "predial" in norm:
+        # Prioridad ajustada: nota_secretaria > cartelera > expediente > predial
+        if ("nota" in norm and "secretar" in norm):
+            category = "nota_secretaria"
+            # Primero intentamos radicado estricto; si no, usar numero de factura
+            number = find_radicado_number_strict(page_text)
+            if not number:
+                number = find_invoice_number(page_text)
+            if not number and allow_fallback:
+                # como último recurso, intenta patrones menos estrictos
+                number = find_radicado_number(page_text)
+        elif ("carteler" in norm) or is_cartelera_hint(page_text):
+            # Acepta 'cartelera', 'carteleras' y casos con pistas fuertes + Radicación
+            category = "cartelera"
+            number = find_radicado_number_strict(page_text)
+            if not number and allow_fallback:
+                number = find_radicado_number(page_text)
+        elif "expediente" in norm:
+            category = "expediente"
+            number = find_expediente_number(page_text)
+            if not number and allow_fallback:
+                longest = ""
+                for m in re.finditer(r"(\d{6,})", _normalize_text(page_text)):
+                    if len(m.group(1)) > len(longest):
+                        longest = m.group(1)
+                number = longest if len(longest) >= 6 else None
+        elif "predial" in norm:
             category = "predial"
             number = find_radicado_number(page_text)
             if not number and allow_fallback:
@@ -392,15 +454,6 @@ def process_classify_rename(
                         if len(m.group(1)) > len(longest):
                             longest = m.group(1)
                     number = longest if len(longest) >= 12 else None
-        elif ("nota" in norm and "secretar" in norm):
-            category = "nota_secretaria"
-            number = find_radicado_number_strict(page_text)
-        elif "cartelera" in norm:
-            category = "cartelera"
-            number = find_radicado_number_strict(page_text)
-        elif "expediente" in norm:
-            category = "expediente"
-            number = find_expediente_number(page_text)
         else:
             skipped.append((src_path, "sin_categoria"))
             continue
@@ -409,8 +462,10 @@ def process_classify_rename(
             motivo = "sin_numero"
             if category == "expediente":
                 motivo = "sin_expediente"
-            elif category in ("cartelera", "nota_secretaria"):
+            elif category == "cartelera":
                 motivo = "sin_radicado"
+            elif category == "nota_secretaria":
+                motivo = "sin_radicado_y_factura"
             skipped.append((src_path, motivo))
             print(f"[AVISO] {category}: palabra clave encontrada, pero sin número; se omite.")
             continue
