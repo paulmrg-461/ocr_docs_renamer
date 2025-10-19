@@ -832,6 +832,64 @@ def process_prefix_rename(
                 print("[AVISO] 'Auto que avoca/avocar conocimiento' detectado pero sin número de expediente.")
             continue
 
+        # 7) DF {numero_radicado}: 'prensa y comunicaciones' o 'solicitud de publicacion de medios'
+        has_prensa_comms = re.search(r"prensa\s+y\s+comunicaciones", norm)
+        has_solic_pub_medios = re.search(r"solicitud\s+de\s+publicacion\s+(?:en|de)\s+medios", norm)
+        if has_prensa_comms or has_solic_pub_medios:
+            rad = _get_radicado(page_text) or find_radicado_near_tokens(page_text)
+            if rad:
+                new_name = f"DF {rad}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_radicado_df"))
+                print("[AVISO] 'Prensa y comunicaciones/Solicitud de publicacion de medios' detectado pero sin número de radicado.")
+            continue
+
+        # 8) NC {numero_radicado}: 'publicacion' + 'cartelera' (o 'cartela')
+        has_publicacion = re.search(r"publicaci[oó]n", norm)
+        has_cartelera = ("carteler" in norm)
+        if has_publicacion and has_cartelera:
+            rad = _get_radicado(page_text) or find_radicado_near_tokens(page_text)
+            if rad:
+                new_name = f"NC {rad}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_radicado_nc"))
+                print("[AVISO] 'Publicacion/Cartelera' detectados pero sin número de radicado.")
+            continue
+
+        # 9) FJ {numero_radicado}: 'publiquese'
+        if re.search(r"\bpubliquese\b", norm):
+            rad = _get_radicado(page_text) or find_radicado_near_tokens(page_text)
+            if rad:
+                new_name = f"FJ {rad}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_radicado_fj"))
+                print("[AVISO] 'Publiquese' detectado pero sin número de radicado.")
+            continue
+
         # Si no coincide ninguna regla:
         skipped.append((src_path, "sin_prefijo"))
         continue
@@ -852,7 +910,7 @@ def parse_args():
     parser.add_argument("--classify-rename", action="store_true", help="Clasificar y renombrar por categorías: predial/cartelera/nota_secretaria/expediente")
     parser.add_argument("--classify-out-root", default=None, help="Carpeta raíz de salida para clasificación (crea subcarpetas)")
     parser.add_argument("--allow-fallback", action="store_true", help="Permitir renombrar con dígitos largos si no se halla el radicado/expediente")
-    parser.add_argument("--prefix-rename", action="store_true", help="Renombrar por prefijos en el mismo directorio basados en la primera página (ej. 'TE {numero_factura}', 'CE', 'MP', 'CMP', 'NPMP', 'AP', 'AC')")
+    parser.add_argument("--prefix-rename", action="store_true", help="Renombrar por prefijos en el mismo directorio basados en la primera página (ej. 'TE {numero_factura}', 'CE', 'MP', 'CMP', 'NPMP', 'AP', 'AC', 'DF', 'NC', 'FJ')")
     parser.add_argument("--prefix-out-dir", default=None, help="Carpeta destino para el modo prefijos (por defecto usa el mismo directorio)")
     return parser.parse_args()
 
