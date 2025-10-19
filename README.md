@@ -69,9 +69,6 @@ ocr_docs_renamer/
 ├── ocr_pdf.py
 └── requirements.txt
 ```
-```bash
-python "c:\Users\paulm\Documents\dev-projects\DevPaul\ocr_docs_renamer\ocr_pdf.py" --dir "c:\Users\paulm\Documents\dev-projects\DevPaul\ocr_docs_renamer\docs" --predial-rename --lang en --dpi 300 --predial-out-dir "c:\Users\paulm\Documents\dev-projects\DevPaul\ocr_docs_renamer\docs\predial"
-```
 
 ## License
 This project is licensed under the MIT License.
