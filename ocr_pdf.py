@@ -320,6 +320,83 @@ def find_expediente_number(text: str) -> str | None:
     return None
 
 
+def find_invoice_number_official(text: str) -> str | None:
+    """
+    Extrae número de 'Factura oficial' evitando confundirlo con NIT.
+    Busca variaciones de indicador: "No", "Nº", "N°", "Nro", "Numero", "Num.", "#",
+    ancladas a la frase "Factura oficial" y dentro de una ventana cercana.
+    Devuelve solo dígitos si longitud >= 6.
+    """
+    norm = _normalize_text(text).lower()
+    candidates: list[str] = []
+
+    # Patrón principal: 'factura oficial' seguido de No/Nº/N°/Nro/Numero/Num/# y el número
+    pat_main = r"(?:factura\s+oficial(?:es)?[^\n]{0,120}?(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)\s*[:\-]?\s*([0-9][\d\-\.\s]{5,}))"
+    for m in re.finditer(pat_main, norm):
+        # Si cerca aparece 'nit', descartamos (probable NIT de entidad)
+        window = norm[max(0, m.start()-40): m.end()+40]
+        if "nit" in window:
+            continue
+        candidates.append(m.group(1))
+
+    # Fallback: localizar 'factura oficial' y buscar el indicador en la vecindad
+    for mf in re.finditer(r"factura\s+oficial(?:es)?", norm):
+        segment = norm[mf.end(): mf.end() + 300]
+        m2 = re.search(r"(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)\s*[:\-]?\s*([0-9][\d\-\.\s]{5,})", segment)
+        if m2:
+            window = segment[max(0, m2.start()-30): m2.end()+30]
+            if "nit" in window:
+                continue
+            candidates.append(m2.group(1))
+
+    # Post-proceso: devolver el primer candidato válido
+    for cand in candidates:
+        digits = re.sub(r"\D", "", cand)
+        if len(digits) >= 6:
+            return digits
+    return None
+
+
+def find_resolution_mandamiento_pago(text: str) -> str | None:
+    """
+    Extrae el número/código de la "Resolución de mandamiento de pago" en la primera página.
+    - Busca "resolución" cerca de "mandamiento de pago" con indicadores: No, Nº, N°, Nro, Numero, Num., #
+    - Devuelve un token saneado (A-Z, 0-9, '-', '.') y en mayúsculas.
+    """
+    norm = _normalize_text(text).lower()
+    candidates: list[str] = []
+
+    # Patrón principal: resolucion ~ mandamiento de pago + indicador y número/código
+    pat = r"(?:resoluci[oó]n[^\n]{0,150}?mandamiento\s+de\s+pago|mandamiento\s+de\s+pago[^\n]{0,150}?resoluci[oó]n)[^\n]{0,150}?(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)\s*[:\-]?\s*([a-z0-9][a-z0-9\-\.\/]{4,})"
+    for m in re.finditer(pat, norm):
+        candidates.append(m.group(1))
+
+    # Fallback 1: localizar "mandamiento de pago" y luego buscar "resolución ... No" con número
+    for mp in re.finditer(r"mandamiento\s+de\s+pago", norm):
+        segment = norm[mp.end(): mp.end() + 220]
+        m2 = re.search(r"resoluci[oó]n[^\n]{0,150}?(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)\s*[:\-]?\s*([a-z0-9][a-z0-9\-\.\/]{4,})", segment)
+        if m2:
+            candidates.append(m2.group(1))
+
+    # Fallback 2: solo indicador cercano tras "mandamiento de pago"
+    if not candidates:
+        for mp in re.finditer(r"mandamiento\s+de\s+pago", norm):
+            segment = norm[mp.end(): mp.end() + 220]
+            m3 = re.search(r"(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)\s*[:\-]?\s*([a-z0-9][a-z0-9\-\.\/]{4,})", segment)
+            if m3:
+                candidates.append(m3.group(1))
+
+    # Sanitizar y validar
+    for cand in candidates:
+        c = re.sub(r"[ ]+", "", cand)
+        c = c.upper().replace("/", "-").replace("\\", "-").replace(":", "-")
+        c = re.sub(r"[^A-Z0-9\-.]", "", c).strip(".-")
+        # exigir al menos 5 caracteres alfanuméricos totales
+        if len(re.sub(r"[^A-Z0-9]", "", c)) >= 5:
+            return c
+    return None
+
+
 def find_invoice_number(text: str) -> str | None:
     """
     Extrae número de 'Factura'. Devuelve dígitos si longitud >= 6.
@@ -496,14 +573,16 @@ def process_prefix_rename(
     Renombra PDFs en el MISMO directorio según prefijos basados EXCLUSIVAMENTE en la primera página.
 
     Categorías implementadas (todo en mayúsculas):
-    - TE {numero_factura}: cuando se detecte "factura oficial" en la primera página.
-    - DF {numero_radicado}: cuando se detecte "prensa y comunicaciones" o "solicitud de publicacion de medios".
-    - NC {numero_radicado}: cuando se detecten ambas palabras "publicacion" y "cartelera" (o "cartela").
-    - FJ {numero_radicado}: cuando se detecte "publiquese".
-
-    El número de radicado se obtiene con búsqueda estricta y, si allow_fallback=True, se intenta con heurística flexible.
-
-    Devuelve (renamed, skipped): listas de (src, dst) y (src, motivo).
+     - TE {numero_factura}: cuando se detecte "factura oficial" en la primera página.
+     - MP {resolucion}: si el documento contiene simultáneamente "nota" y "secretaria" y además "mandamiento de pago"; se extrae la resolución de mandamiento de pago.
+     - CE {numero_factura}: cuando aparezcan las palabras "nota" y "secretaria" en la primera página (se extrae el número de factura).
+     - DF {numero_radicado}: cuando se detecte "prensa y comunicaciones" o "solicitud de publicacion de medios".
+     - NC {numero_radicado}: cuando se detecten ambas palabras "publicacion" y "cartelera" (o "cartela").
+     - FJ {numero_radicado}: cuando se detecte "publiquese".
+ 
+     El número de radicado se obtiene con búsqueda estricta y, si allow_fallback=True, se intenta con heurística flexible.
+ 
+     Devuelve (renamed, skipped): listas de (src, dst) y (src, motivo).
     """
     if not os.path.isdir(dir_path):
         raise FileNotFoundError(f"Directorio no encontrado: {dir_path}")
@@ -538,7 +617,7 @@ def process_prefix_rename(
 
         # 1) TE {numero_factura}: requiere "factura oficial"
         if re.search(r"\bfactura\s+oficial(es)?\b", norm):
-            inv = find_invoice_number(page_text)
+            inv = find_invoice_number_official(page_text)
             if inv:
                 new_name = f"TE {inv}.pdf"
                 dst_path = ensure_unique_path(target_dir, new_name)
@@ -553,8 +632,47 @@ def process_prefix_rename(
                 skipped.append((src_path, "sin_numero_factura"))
                 print("[AVISO] 'factura oficial' detectado pero sin número de factura válido.")
             continue
+ 
+        # 2) CE {numero_factura} o MP {resolucion}: cuando aparezcan 'nota' y 'secretaria' en la primera página
+        has_nota = re.search(r"\bnota\b", norm)
+        has_secretaria = re.search(r"\bsecretar\w*\b", norm) or re.search(r"\bsecretaria\b", norm)
+        if has_nota and has_secretaria:
+            # Si también contiene 'mandamiento de pago', priorizar MP
+            if re.search(r"mandamiento\s+de\s+pago", norm):
+                res_mp = find_resolution_mandamiento_pago(page_text)
+                if res_mp:
+                    new_name = f"MP {res_mp}.pdf"
+                    dst_path = ensure_unique_path(target_dir, new_name)
+                    try:
+                        shutil.move(src_path, dst_path)
+                        print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                        renamed.append((src_path, dst_path))
+                    except Exception as e:
+                        print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                        skipped.append((src_path, "error_renombrar"))
+                else:
+                    skipped.append((src_path, "sin_resolucion_mp"))
+                    print("[AVISO] 'Nota/Secretaria' + 'Mandamiento de pago' detectado pero sin resolución válida.")
+                # En ambos casos no intentamos CE; pasamos al siguiente archivo
+                continue
+            # Si no es mandamiento de pago, aplicar CE
+            inv_ce = find_invoice_number_official(page_text) or find_invoice_number(page_text)
+            if inv_ce:
+                new_name = f"CE {inv_ce}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_numero_factura"))
+                print("[AVISO] 'Nota/Secretaria' detectado pero sin número de factura válido.")
+            continue
 
-        # 2) FJ {numero_radicado}: cuando aparezca "publiquese" (incluye 'publíquese' por normalización)
+        # 3) FJ {numero_radicado}: cuando aparezca "publiquese" (incluye 'publíquese' por normalización)
         if re.search(r"\bpubliquese\b", norm):
             rad = _get_radicado(page_text)
             if rad:
@@ -572,7 +690,7 @@ def process_prefix_rename(
                 print("[AVISO] 'PUBLIQUESE' detectado pero sin número de radicado reconocido.")
             continue
 
-        # 3) NC {numero_radicado}: requiere 'publicacion' y 'cartelera'/'cartela'
+        # 4) NC {numero_radicado}: requiere 'publicacion' y 'cartelera'/'cartela'
         has_publicacion = re.search(r"\bpublicacion\b", norm)
         has_cartelera = re.search(r"\bcartelera\b", norm) or re.search(r"\bcartela\b", norm)
         if has_publicacion and has_cartelera:
@@ -592,7 +710,7 @@ def process_prefix_rename(
                 print("[AVISO] 'Publicacion' y 'Cartelera/Cartela' detectados pero sin número de radicado.")
             continue
 
-        # 4) DF {numero_radicado}: 'prensa y comunicaciones' o 'solicitud de publicacion de/en medios'
+        # 5) DF {numero_radicado}: 'prensa y comunicaciones' o 'solicitud de publicacion de/en medios'
         is_df = (
             ("prensa y comunicaciones" in norm) or
             ("prensa y comunicacion" in norm) or
