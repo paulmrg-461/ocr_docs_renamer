@@ -484,6 +484,145 @@ def process_classify_rename(
     return renamed, skipped
 
 
+def process_prefix_rename(
+    dir_path: str,
+    lang: str = "latin",
+    dpi: int = 300,
+    min_score: float = 0.0,
+    out_dir: str | None = None,
+    allow_fallback: bool = False,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """
+    Renombra PDFs en el MISMO directorio según prefijos basados EXCLUSIVAMENTE en la primera página.
+
+    Categorías implementadas (todo en mayúsculas):
+    - TE {numero_factura}: cuando se detecte "factura oficial" en la primera página.
+    - DF {numero_radicado}: cuando se detecte "prensa y comunicaciones" o "solicitud de publicacion de medios".
+    - NC {numero_radicado}: cuando se detecten ambas palabras "publicacion" y "cartelera" (o "cartela").
+    - FJ {numero_radicado}: cuando se detecte "publiquese".
+
+    El número de radicado se obtiene con búsqueda estricta y, si allow_fallback=True, se intenta con heurística flexible.
+
+    Devuelve (renamed, skipped): listas de (src, dst) y (src, motivo).
+    """
+    if not os.path.isdir(dir_path):
+        raise FileNotFoundError(f"Directorio no encontrado: {dir_path}")
+
+    print(f"[INFO] Inicializando PaddleOCR para renombrar por prefijos (lang={lang})...")
+    ocr = create_ocr(lang)
+
+    renamed: list[tuple[str, str]] = []
+    skipped: list[tuple[str, str]] = []
+    pdf_files = [f for f in os.listdir(dir_path) if f.lower().endswith(".pdf")]
+    if not pdf_files:
+        print("[AVISO] No se encontraron archivos PDF en el directorio.")
+
+    def _get_radicado(text: str) -> str | None:
+        rad = find_radicado_number_strict(text)
+        if not rad and allow_fallback:
+            rad = find_radicado_number(text)
+        return rad
+
+    for filename in sorted(pdf_files):
+        src_path = os.path.join(dir_path, filename)
+        print(f"[INFO] Analizando primera página: {src_path}")
+        try:
+            page_text = extract_text_first_page(ocr, src_path, dpi=dpi, min_score=min_score)
+        except Exception as e:
+            print(f"[ERROR] Falló OCR en primera página para {src_path}: {e}")
+            skipped.append((src_path, "error_ocr"))
+            continue
+
+        norm = _normalize_text(page_text).lower()
+        target_dir = out_dir if out_dir else dir_path
+
+        # 1) TE {numero_factura}: requiere "factura oficial"
+        if re.search(r"\bfactura\s+oficial(es)?\b", norm):
+            inv = find_invoice_number(page_text)
+            if inv:
+                new_name = f"TE {inv}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_numero_factura"))
+                print("[AVISO] 'factura oficial' detectado pero sin número de factura válido.")
+            continue
+
+        # 2) FJ {numero_radicado}: cuando aparezca "publiquese" (incluye 'publíquese' por normalización)
+        if re.search(r"\bpubliquese\b", norm):
+            rad = _get_radicado(page_text)
+            if rad:
+                new_name = f"FJ {rad}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_radicado"))
+                print("[AVISO] 'PUBLIQUESE' detectado pero sin número de radicado reconocido.")
+            continue
+
+        # 3) NC {numero_radicado}: requiere 'publicacion' y 'cartelera'/'cartela'
+        has_publicacion = re.search(r"\bpublicacion\b", norm)
+        has_cartelera = re.search(r"\bcartelera\b", norm) or re.search(r"\bcartela\b", norm)
+        if has_publicacion and has_cartelera:
+            rad = _get_radicado(page_text)
+            if rad:
+                new_name = f"NC {rad}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_radicado"))
+                print("[AVISO] 'Publicacion' y 'Cartelera/Cartela' detectados pero sin número de radicado.")
+            continue
+
+        # 4) DF {numero_radicado}: 'prensa y comunicaciones' o 'solicitud de publicacion de/en medios'
+        is_df = (
+            ("prensa y comunicaciones" in norm) or
+            ("prensa y comunicacion" in norm) or
+            ("solicitud de publicacion de medios" in norm) or
+            ("solicitud de publicacion en medios" in norm)
+        )
+        if is_df:
+            rad = _get_radicado(page_text)
+            if rad:
+                new_name = f"DF {rad}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_radicado"))
+                print("[AVISO] 'Prensa y comunicaciones'/'Solicitud de publicacion de/en medios' detectado pero sin radicado.")
+            continue
+
+        # Si no coincide ninguna regla:
+        skipped.append((src_path, "sin_prefijo"))
+        continue
+
+    return renamed, skipped
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="OCR de PDF con PaddleOCR")
     parser.add_argument("--pdf", required=False, help="Ruta al archivo PDF")
@@ -499,6 +638,8 @@ def parse_args():
     parser.add_argument("--classify-rename", action="store_true", help="Clasificar y renombrar por categorías: predial/cartelera/nota_secretaria/expediente")
     parser.add_argument("--classify-out-root", default=None, help="Carpeta raíz de salida para clasificación (crea subcarpetas)")
     parser.add_argument("--allow-fallback", action="store_true", help="Permitir renombrar con dígitos largos si no se halla el radicado/expediente")
+    parser.add_argument("--prefix-rename", action="store_true", help="Renombrar por prefijos en el mismo directorio basados en la primera página (ej. 'te {numero_factura}')")
+    parser.add_argument("--prefix-out-dir", default=None, help="Carpeta destino para el modo prefijos (por defecto usa el mismo directorio)")
     return parser.parse_args()
 
 
@@ -510,9 +651,10 @@ if __name__ == "__main__":
         if not args.pdf and not args.dir:
             if os.path.isdir(default_dir):
                 args.dir = default_dir
-                if not getattr(args, "predial_rename", False) and not getattr(args, "classify_rename", False):
-                    setattr(args, "classify_rename", True)
-                print(f"[INFO] No se proporcionó --pdf ni --dir. Usando modo clasificación por defecto (lang={args.lang}, dpi={args.dpi}, min-score={args.min_score}) en: {args.dir}")
+                # Modo por defecto actualizado: prefijos en el mismo directorio
+                if not getattr(args, "predial_rename", False) and not getattr(args, "classify_rename", False) and not getattr(args, "prefix_rename", False):
+                    setattr(args, "prefix_rename", True)
+                print(f"[INFO] No se proporcionó --pdf ni --dir. Usando modo prefijos por defecto (lang={args.lang}, dpi={args.dpi}, min-score={args.min_score}) en: {args.dir}")
             else:
                 print("[ERROR] Debes proporcionar --pdf o --dir. No se encontró carpeta 'docs' en el directorio actual.")
                 sys.exit(1)
@@ -525,6 +667,22 @@ if __name__ == "__main__":
                 min_score=args.min_score,
             )
             print("\n===== Resumen (Predial-Renombrar) =====")
+            print(f"Renombrados ({len(renamed)}):")
+            for src, dst in renamed:
+                print(f" - {os.path.basename(src)} -> {os.path.basename(dst)}")
+            print(f"Omitidos ({len(skipped)}):")
+            for src, motivo in skipped:
+                print(f" - {os.path.basename(src)} ({motivo})")
+        elif getattr(args, "prefix_rename", False) and args.dir:
+            renamed, skipped = process_prefix_rename(
+                dir_path=args.dir,
+                lang=args.lang,
+                dpi=args.dpi,
+                min_score=args.min_score,
+                out_dir=args.prefix_out_dir,
+                allow_fallback=args.allow_fallback,
+            )
+            print("\n===== Resumen (Prefijos-Renombrar) =====")
             print(f"Renombrados ({len(renamed)}):")
             for src, dst in renamed:
                 print(f" - {os.path.basename(src)} -> {os.path.basename(dst)}")
