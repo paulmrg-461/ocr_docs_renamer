@@ -462,6 +462,35 @@ def find_resolution_acuerdo_pago(text: str) -> str | None:
     return None
 
 
+# General extractor for 'Resolución' tokens (used for RREX and similar)
+# Looks for 'resolución' or 'res.' followed by an indicator (No, Nº, N°, Nro, Numero, Num., #)
+# and a code/number token. Sanitizes to uppercase and replaces slashes with hyphens.
+# Returns None if no plausible token (>=5 alphanumerics) is found.
+
+def find_resolution_general(text: str) -> str | None:
+    norm = _normalize_text(text).lower()
+    candidates: list[str] = []
+
+    # Main pattern: 'resolución' anywhere on the page with optional indicator and code
+    pat_main = r"resoluci[oó]n[^\n]{0,150}?(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)?\s*[:\-]?\s*([a-z0-9][a-z0-9\-\.\/]{4,})"
+    for m in re.finditer(pat_main, norm):
+        candidates.append(m.group(1))
+
+    # Abbreviation 'Res.'
+    pat_abbr = r"\bres\.?\s*(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)?\s*[:\-]?\s*([a-z0-9][a-z0-9\-\.\/]{4,})"
+    for m in re.finditer(pat_abbr, norm):
+        candidates.append(m.group(1))
+
+    # Sanitize candidates
+    for cand in candidates:
+        c = re.sub(r"[ ]+", "", cand)
+        c = c.upper().replace("/", "-").replace("\\", "-").replace(":", "-")
+        c = re.sub(r"[^A-Z0-9\-.]", "", c).strip(".-")
+        if len(re.sub(r"[^A-Z0-9]", "", c)) >= 5:
+            return c
+    return None
+
+
 def find_radicado_near_tokens(text: str) -> str | None:
     """
     Extrae el número de radicado alrededor de las palabras 'Radicación' o 'Radicado',
@@ -647,6 +676,7 @@ def process_prefix_rename(
      - CMP {numero_radicado}: cuando se detecten simultáneamente "citacion", "notificacion" y "mandamiento de pago"; se extrae el número de radicado/radicación.
      - NPMP {numero_radicado}: cuando se detecte "asunto" y "notificación por correo"; se extrae el número de radicado (soporta "RADICACION {numero}", "{numero} RADICACION" y "Radicado ...").
      - AP {numero_resolucion}: cuando se detecte "acuerdo de pago" o "acuerdo de pago de impuesto"; se extrae la resolución.
+     - RREX {numero_resolucion}: cuando se detecte "prescripción" junto con "predial" (p. ej., "prescripción de impuesto predial"); se extrae el número de resolución.
      - AC {numero_expediente}: cuando se detecte "auto" junto con "avoca/avocar" y "conocimiento"; se extrae el número de expediente.
      - DF {numero_radicado}: cuando se detecte "prensa y comunicaciones" o "solicitud de publicacion de medios".
      - NC {numero_radicado}: cuando se detecten ambas palabras "publicacion" y "cartelera" (o "cartela").
@@ -785,7 +815,30 @@ def process_prefix_rename(
                 print("[AVISO] 'Asunto: Notificación por correo' detectado pero sin número de radicado.")
             continue
  
-        # 5) AP {numero_resolucion}: 'acuerdo de pago' o 'acuerdo de pago de impuesto'
+        # 5) RREX {numero_resolucion}: 'peticion' + 'prescripcion' + 'impuesto predial'
+        has_peticion = re.search(r"\bpetici[oó]n\b", norm)
+        # Señales más amplias: cualquiera de 'prescrib' o 'prescripc' y 'predial' o 'impuesto predial'
+        has_presc_predial = bool(re.search(r"prescripci[oó]n[^\n]{0,120}?impuesto\s+predial", norm)) or bool(re.search(r"impuesto\s+predial[^\n]{0,120}?prescripci[oó]n", norm))
+        has_presc = bool(re.search(r"\bprescrib|prescripc", norm))
+        has_predial = bool(re.search(r"\bpredial\b", norm)) or bool(re.search(r"impuesto\s+predial", norm))
+        if has_presc_predial or (has_presc and has_predial):
+            res_rrex = find_resolution_general(page_text)
+            if res_rrex:
+                new_name = f"RREX {res_rrex}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_resolucion_rrex"))
+                print("[AVISO] 'Peticion sobre prescripcion de impuesto predial' detectada pero sin número de resolución.")
+            continue
+ 
+        # 6) AP {numero_resolucion}: 'acuerdo de pago' o 'acuerdo de pago de impuesto'
         has_ap = re.search(r"acuerdo\s+de\s+pago(?:\s+de\s+impuesto)?", norm)
         if has_ap:
             res_ap = find_resolution_acuerdo_pago(page_text)
@@ -802,6 +855,28 @@ def process_prefix_rename(
             else:
                 skipped.append((src_path, "sin_resolucion_ap"))
                 print("[AVISO] 'Acuerdo de pago' detectado pero sin número de resolución.")
+            continue
+ 
+        # 5.1) RREX {numero_resolucion}: 'peticion' + 'prescripcion' + 'impuesto predial'
+        # Señales más amplias: cualquiera de 'prescrib' o 'prescripc' y 'predial' o 'impuesto predial'
+        has_presc_predial = bool(re.search(r"prescripci[oó]n[^\n]{0,120}?impuesto\s+predial", norm)) or bool(re.search(r"impuesto\s+predial[^\n]{0,120}?prescripci[oó]n", norm))
+        has_presc = bool(re.search(r"\bprescrib|prescripc", norm))
+        has_predial = bool(re.search(r"\bpredial\b", norm)) or bool(re.search(r"impuesto\s+predial", norm))
+        if has_presc_predial or (has_presc and has_predial):
+            res_rrex = find_resolution_general(page_text)
+            if res_rrex:
+                new_name = f"RREX {res_rrex}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_resolucion_rrex"))
+                print("[AVISO] 'Peticion sobre prescripcion de impuesto predial' detectada pero sin número de resolución.")
             continue
  
         # 6) AC {numero_expediente}: 'auto' + 'avoca/avocar' + 'conocimiento'
@@ -910,7 +985,7 @@ def parse_args():
     parser.add_argument("--classify-rename", action="store_true", help="Clasificar y renombrar por categorías: predial/cartelera/nota_secretaria/expediente")
     parser.add_argument("--classify-out-root", default=None, help="Carpeta raíz de salida para clasificación (crea subcarpetas)")
     parser.add_argument("--allow-fallback", action="store_true", help="Permitir renombrar con dígitos largos si no se halla el radicado/expediente")
-    parser.add_argument("--prefix-rename", action="store_true", help="Renombrar por prefijos en el mismo directorio basados en la primera página (ej. 'TE {numero_factura}', 'CE', 'MP', 'CMP', 'NPMP', 'AP', 'AC', 'DF', 'NC', 'FJ')")
+    parser.add_argument("--prefix-rename", action="store_true", help="Renombrar por prefijos en el mismo directorio basados en la primera página (ej. 'TE {numero_factura}', 'CE', 'MP', 'CMP', 'NPMP', 'AP', 'RREX', 'AC', 'DF', 'NC', 'FJ')")
     parser.add_argument("--prefix-out-dir", default=None, help="Carpeta destino para el modo prefijos (por defecto usa el mismo directorio)")
     return parser.parse_args()
 
