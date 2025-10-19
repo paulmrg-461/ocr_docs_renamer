@@ -423,6 +423,74 @@ def find_invoice_number(text: str) -> str | None:
     return None
 
 
+def find_resolution_acuerdo_pago(text: str) -> str | None:
+    """
+    Extrae el número/código de la "Resolución de acuerdo de pago" en la primera página.
+    - Busca "resolución" cerca de "acuerdo de pago" (o "acuerdo de pago de impuesto") con indicadores: No, Nº, N°, Nro, Numero, Num., #
+    - Devuelve un token saneado (A-Z, 0-9, '-', '.') y en mayúsculas.
+    """
+    norm = _normalize_text(text).lower()
+    candidates: list[str] = []
+
+    # Patrón principal: resolucion ~ acuerdo de pago + indicador y número/código
+    pat = r"(?:resoluci[oó]n[^\n]{0,150}?acuerdo\s+de\s+pago(?:\s+de\s+impuesto)?|acuerdo\s+de\s+pago(?:\s+de\s+impuesto)?[^\n]{0,150}?resoluci[oó]n)[^\n]{0,150}?(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)\s*[:\-]?\s*([a-z0-9][a-z0-9\-\.\/]{4,})"
+    for m in re.finditer(pat, norm):
+        candidates.append(m.group(1))
+
+    # Fallback 1: localizar "acuerdo de pago" y luego buscar "resolución ... No" con número
+    for ap in re.finditer(r"acuerdo\s+de\s+pago(?:\s+de\s+impuesto)?", norm):
+        segment = norm[ap.end(): ap.end() + 220]
+        m2 = re.search(r"resoluci[oó]n[^\n]{0,150}?(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)\s*[:\-]?\s*([a-z0-9][a-z0-9\-\.\/]{4,})", segment)
+        if m2:
+            candidates.append(m2.group(1))
+
+    # Fallback 2: solo indicador cercano tras "acuerdo de pago"
+    if not candidates:
+        for ap in re.finditer(r"acuerdo\s+de\s+pago(?:\s+de\s+impuesto)?", norm):
+            segment = norm[ap.end(): ap.end() + 220]
+            m3 = re.search(r"(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)\s*[:\-]?\s*([a-z0-9][a-z0-9\-\.\/]{4,})", segment)
+            if m3:
+                candidates.append(m3.group(1))
+
+    # Sanitizar y validar
+    for cand in candidates:
+        c = re.sub(r"[ ]+", "", cand)
+        c = c.upper().replace("/", "-").replace("\\", "-").replace(":", "-")
+        c = re.sub(r"[^A-Z0-9\-.]", "", c).strip(".-")
+        if len(re.sub(r"[^A-Z0-9]", "", c)) >= 5:
+            return c
+    return None
+
+
+def find_radicado_near_tokens(text: str) -> str | None:
+    """
+    Extrae el número de radicado alrededor de las palabras 'Radicación' o 'Radicado',
+    permitiendo que el número aparezca ANTES o DESPUÉS del término.
+    - Soporta formas: "RADICACION {numero}", "{numero} RADICACION", "Radicado No {numero}".
+    - Devuelve dígitos si longitud >= 12.
+    """
+    if not text:
+        return None
+    norm = _normalize_text(text)
+    candidates: list[str] = []
+    for m in re.finditer(r"(?i)radicaci[oó]n|radicado", norm):
+        # Búsqueda después del término
+        seg_after = norm[m.end(): m.end() + 140]
+        m_after = re.search(r"(?:n[oº]\.??|no\.?|numero|#|num\.?)?\s*[:\-]?\s*([0-9][\d\-\.\s]{8,})", seg_after)
+        if m_after:
+            candidates.append(m_after.group(1))
+        # Búsqueda antes del término (número inmediatamente antes)
+        seg_before = norm[max(0, m.start() - 80): m.start()]
+        m_before = re.search(r"([0-9][\d\-\.\s]{8,})\s*$", seg_before)
+        if m_before:
+            candidates.append(m_before.group(1))
+    for cand in candidates:
+        digits = re.sub(r"\D", "", cand)
+        if len(digits) >= 12:
+            return digits
+    return None
+
+
 def is_cartelera_hint(text: str) -> bool:
     norm = _normalize_text(text).lower()
     has_radicado = bool(re.search(r"(?i)radicaci[oó]n|radicado", norm))
@@ -576,12 +644,16 @@ def process_prefix_rename(
      - TE {numero_factura}: cuando se detecte "factura oficial" en la primera página.
      - MP {resolucion}: si el documento contiene simultáneamente "nota" y "secretaria" y además "mandamiento de pago"; se extrae la resolución de mandamiento de pago.
      - CE {numero_factura}: cuando aparezcan las palabras "nota" y "secretaria" en la primera página (se extrae el número de factura).
+     - CMP {numero_radicado}: cuando se detecten simultáneamente "citacion", "notificacion" y "mandamiento de pago"; se extrae el número de radicado/radicación.
+     - NPMP {numero_radicado}: cuando se detecte "asunto" y "notificación por correo"; se extrae el número de radicado (soporta "RADICACION {numero}", "{numero} RADICACION" y "Radicado ...").
+     - AP {numero_resolucion}: cuando se detecte "acuerdo de pago" o "acuerdo de pago de impuesto"; se extrae la resolución.
+     - AC {numero_expediente}: cuando se detecte "auto" junto con "avoca/avocar" y "conocimiento"; se extrae el número de expediente.
      - DF {numero_radicado}: cuando se detecte "prensa y comunicaciones" o "solicitud de publicacion de medios".
      - NC {numero_radicado}: cuando se detecten ambas palabras "publicacion" y "cartelera" (o "cartela").
      - FJ {numero_radicado}: cuando se detecte "publiquese".
- 
+  
      El número de radicado se obtiene con búsqueda estricta y, si allow_fallback=True, se intenta con heurística flexible.
- 
+  
      Devuelve (renamed, skipped): listas de (src, dst) y (src, motivo).
     """
     if not os.path.isdir(dir_path):
@@ -671,12 +743,15 @@ def process_prefix_rename(
                 skipped.append((src_path, "sin_numero_factura"))
                 print("[AVISO] 'Nota/Secretaria' detectado pero sin número de factura válido.")
             continue
-
-        # 3) FJ {numero_radicado}: cuando aparezca "publiquese" (incluye 'publíquese' por normalización)
-        if re.search(r"\bpubliquese\b", norm):
+ 
+        # 3) CMP {numero_radicado}: 'citacion' + 'notificacion' + 'mandamiento de pago'
+        has_citacion = re.search(r"\bcitaci\w*\b", norm)
+        has_notificacion = re.search(r"\bnotific\w*\b", norm)
+        has_mp = re.search(r"mandamiento\s+de\s+pago", norm)
+        if has_citacion and has_notificacion and has_mp:
             rad = _get_radicado(page_text)
             if rad:
-                new_name = f"FJ {rad}.pdf"
+                new_name = f"CMP {rad}.pdf"
                 dst_path = ensure_unique_path(target_dir, new_name)
                 try:
                     shutil.move(src_path, dst_path)
@@ -687,16 +762,16 @@ def process_prefix_rename(
                     skipped.append((src_path, "error_renombrar"))
             else:
                 skipped.append((src_path, "sin_radicado"))
-                print("[AVISO] 'PUBLIQUESE' detectado pero sin número de radicado reconocido.")
+                print("[AVISO] 'Citacion/Notificacion/Mandamiento de pago' detectados pero sin número de radicado.")
             continue
-
-        # 4) NC {numero_radicado}: requiere 'publicacion' y 'cartelera'/'cartela'
-        has_publicacion = re.search(r"\bpublicacion\b", norm)
-        has_cartelera = re.search(r"\bcartelera\b", norm) or re.search(r"\bcartela\b", norm)
-        if has_publicacion and has_cartelera:
-            rad = _get_radicado(page_text)
+ 
+        # 4) NPMP {numero_radicado}: 'Asunto' + 'Notificación por correo'
+        has_asunto = re.search(r"\basunto\b", norm)
+        has_notif_correo = re.search(r"notificaci[oó]n\s+por\s+correo", norm)
+        if has_asunto and has_notif_correo:
+            rad = _get_radicado(page_text) or find_radicado_near_tokens(page_text)
             if rad:
-                new_name = f"NC {rad}.pdf"
+                new_name = f"NPMP {rad}.pdf"
                 dst_path = ensure_unique_path(target_dir, new_name)
                 try:
                     shutil.move(src_path, dst_path)
@@ -706,21 +781,16 @@ def process_prefix_rename(
                     print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
                     skipped.append((src_path, "error_renombrar"))
             else:
-                skipped.append((src_path, "sin_radicado"))
-                print("[AVISO] 'Publicacion' y 'Cartelera/Cartela' detectados pero sin número de radicado.")
+                skipped.append((src_path, "sin_radicado_npmp"))
+                print("[AVISO] 'Asunto: Notificación por correo' detectado pero sin número de radicado.")
             continue
-
-        # 5) DF {numero_radicado}: 'prensa y comunicaciones' o 'solicitud de publicacion de/en medios'
-        is_df = (
-            ("prensa y comunicaciones" in norm) or
-            ("prensa y comunicacion" in norm) or
-            ("solicitud de publicacion de medios" in norm) or
-            ("solicitud de publicacion en medios" in norm)
-        )
-        if is_df:
-            rad = _get_radicado(page_text)
-            if rad:
-                new_name = f"DF {rad}.pdf"
+ 
+        # 5) AP {numero_resolucion}: 'acuerdo de pago' o 'acuerdo de pago de impuesto'
+        has_ap = re.search(r"acuerdo\s+de\s+pago(?:\s+de\s+impuesto)?", norm)
+        if has_ap:
+            res_ap = find_resolution_acuerdo_pago(page_text)
+            if res_ap:
+                new_name = f"AP {res_ap}.pdf"
                 dst_path = ensure_unique_path(target_dir, new_name)
                 try:
                     shutil.move(src_path, dst_path)
@@ -730,8 +800,36 @@ def process_prefix_rename(
                     print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
                     skipped.append((src_path, "error_renombrar"))
             else:
-                skipped.append((src_path, "sin_radicado"))
-                print("[AVISO] 'Prensa y comunicaciones'/'Solicitud de publicacion de/en medios' detectado pero sin radicado.")
+                skipped.append((src_path, "sin_resolucion_ap"))
+                print("[AVISO] 'Acuerdo de pago' detectado pero sin número de resolución.")
+            continue
+ 
+        # 6) AC {numero_expediente}: 'auto' + 'avoca/avocar' + 'conocimiento'
+        has_auto = re.search(r"\bauto\b", norm)
+        has_avoca = re.search(r"\bavoc\w*\b", norm)
+        has_conocimiento = re.search(r"\bconocim\w*\b", norm)
+        if has_auto and has_avoca and has_conocimiento:
+            exp = find_expediente_number(page_text)
+            if not exp and allow_fallback:
+                # Fallback: dígitos largos (>=6)
+                longest = ""
+                for m in re.finditer(r"(\d{6,})", _normalize_text(page_text)):
+                    if len(m.group(1)) > len(longest):
+                        longest = m.group(1)
+                exp = longest if len(longest) >= 6 else None
+            if exp:
+                new_name = f"AC {exp}.pdf"
+                dst_path = ensure_unique_path(target_dir, new_name)
+                try:
+                    shutil.move(src_path, dst_path)
+                    print(f"[OK] Renombrado: {os.path.basename(src_path)} -> {dst_path}")
+                    renamed.append((src_path, dst_path))
+                except Exception as e:
+                    print(f"[ERROR] No se pudo renombrar {src_path} -> {dst_path}: {e}")
+                    skipped.append((src_path, "error_renombrar"))
+            else:
+                skipped.append((src_path, "sin_expediente"))
+                print("[AVISO] 'Auto que avoca/avocar conocimiento' detectado pero sin número de expediente.")
             continue
 
         # Si no coincide ninguna regla:
@@ -750,13 +848,11 @@ def parse_args():
     parser.add_argument("--gpu", action="store_true", help="Usar GPU si está disponible")
     parser.add_argument("--keyword", default="sentencia", help="Palabra/frase a buscar en el texto OCR (modo carpeta)")
     parser.add_argument("--out-dir", default=None, help="Carpeta destino para mover coincidencias (por defecto '<dir>/procesados')")
-    parser.add_argument("--predial-rename", action="store_true", help="Buscar 'predial' en la primera página y renombrar a predial_{numero}.pdf")
-    parser.add_argument("--predial-out-dir", default=None, help="Carpeta destino para renombrados del modo predial (por defecto '<dir>/predial')")
     parser.add_argument("--min-score", type=float, default=0.80, help="Puntaje mínimo de reconocimiento para filtrar líneas (ej. 0.80 para ignorar manuscritos) [por defecto: 0.80]")
     parser.add_argument("--classify-rename", action="store_true", help="Clasificar y renombrar por categorías: predial/cartelera/nota_secretaria/expediente")
     parser.add_argument("--classify-out-root", default=None, help="Carpeta raíz de salida para clasificación (crea subcarpetas)")
     parser.add_argument("--allow-fallback", action="store_true", help="Permitir renombrar con dígitos largos si no se halla el radicado/expediente")
-    parser.add_argument("--prefix-rename", action="store_true", help="Renombrar por prefijos en el mismo directorio basados en la primera página (ej. 'te {numero_factura}')")
+    parser.add_argument("--prefix-rename", action="store_true", help="Renombrar por prefijos en el mismo directorio basados en la primera página (ej. 'TE {numero_factura}', 'CE', 'MP', 'CMP', 'NPMP', 'AP', 'AC')")
     parser.add_argument("--prefix-out-dir", default=None, help="Carpeta destino para el modo prefijos (por defecto usa el mismo directorio)")
     return parser.parse_args()
 
@@ -764,34 +860,18 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     try:
-        # Defaults: usar carpeta 'docs' y modo de clasificación si no se pasan argumentos
+        # Defaults: usar carpeta 'docs' y modo prefijos si no se pasan argumentos
         default_dir = os.path.join(os.getcwd(), "docs")
         if not args.pdf and not args.dir:
             if os.path.isdir(default_dir):
                 args.dir = default_dir
-                # Modo por defecto actualizado: prefijos en el mismo directorio
-                if not getattr(args, "predial_rename", False) and not getattr(args, "classify_rename", False) and not getattr(args, "prefix_rename", False):
+                if not getattr(args, "classify_rename", False) and not getattr(args, "prefix_rename", False):
                     setattr(args, "prefix_rename", True)
                 print(f"[INFO] No se proporcionó --pdf ni --dir. Usando modo prefijos por defecto (lang={args.lang}, dpi={args.dpi}, min-score={args.min_score}) en: {args.dir}")
             else:
                 print("[ERROR] Debes proporcionar --pdf o --dir. No se encontró carpeta 'docs' en el directorio actual.")
                 sys.exit(1)
-        if getattr(args, "predial_rename", False) and args.dir:
-            renamed, skipped = process_predial_rename(
-                dir_path=args.dir,
-                lang=args.lang,
-                dpi=args.dpi,
-                out_dir=args.predial_out_dir,
-                min_score=args.min_score,
-            )
-            print("\n===== Resumen (Predial-Renombrar) =====")
-            print(f"Renombrados ({len(renamed)}):")
-            for src, dst in renamed:
-                print(f" - {os.path.basename(src)} -> {os.path.basename(dst)}")
-            print(f"Omitidos ({len(skipped)}):")
-            for src, motivo in skipped:
-                print(f" - {os.path.basename(src)} ({motivo})")
-        elif getattr(args, "prefix_rename", False) and args.dir:
+        if getattr(args, "prefix_rename", False) and args.dir:
             renamed, skipped = process_prefix_rename(
                 dir_path=args.dir,
                 lang=args.lang,
