@@ -386,14 +386,28 @@ def find_resolution_mandamiento_pago(text: str) -> str | None:
             if m3:
                 candidates.append(m3.group(1))
 
-    # Sanitizar y validar
+    # Sanitizar y validar (preferir tokens con dígitos)
     for cand in candidates:
         c = re.sub(r"[ ]+", "", cand)
         c = c.upper().replace("/", "-").replace("\\", "-").replace(":", "-")
         c = re.sub(r"[^A-Z0-9\-.]", "", c).strip(".-")
-        # exigir al menos 5 caracteres alfanuméricos totales
-        if len(re.sub(r"[^A-Z0-9]", "", c)) >= 5:
+        alnum_len = len(re.sub(r"[^A-Z0-9]", "", c))
+        digit_len = len(re.sub(r"[^0-9]", "", c))
+        if alnum_len >= 5 and digit_len >= 5:
             return c
+
+    # Fallback 3: buscar números largos (>=12 dígitos) cercanos a 'resolución'
+    for m in re.finditer(r"resoluci[oó]n[^\n]{0,200}?(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)?\s*[:\-]?\s*([0-9][0-9\-\.\s]{11,})", norm):
+        digits = re.sub(r"\D", "", m.group(1))
+        if len(digits) >= 12:
+            return digits
+
+    # Fallback 4: si nada anterior, intentar número largo global en la página
+    m = re.search(r"([0-9][0-9\-\.\s]{11,})", norm)
+    if m:
+        digits = re.sub(r"\D", "", m.group(1))
+        if len(digits) >= 12:
+            return digits
     return None
 
 
@@ -452,12 +466,14 @@ def find_resolution_acuerdo_pago(text: str) -> str | None:
             if m3:
                 candidates.append(m3.group(1))
 
-    # Sanitizar y validar
+    # Sanitizar y validar (preferir tokens con dígitos)
     for cand in candidates:
         c = re.sub(r"[ ]+", "", cand)
         c = c.upper().replace("/", "-").replace("\\", "-").replace(":", "-")
         c = re.sub(r"[^A-Z0-9\-.]", "", c).strip(".-")
-        if len(re.sub(r"[^A-Z0-9]", "", c)) >= 5:
+        alnum_len = len(re.sub(r"[^A-Z0-9]", "", c))
+        digit_len = len(re.sub(r"[^0-9]", "", c))
+        if alnum_len >= 5 and digit_len >= 5:
             return c
     return None
 
@@ -472,7 +488,7 @@ def find_resolution_general(text: str) -> str | None:
     candidates: list[str] = []
 
     # Main pattern: 'resolución' anywhere on the page with optional indicator and code
-    pat_main = r"resoluci[oó]n[^\n]{0,150}?(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)?\s*[:\-]?\s*([a-z0-9][a-z0-9\-\.\/]{4,})"
+    pat_main = r"resoluci[oó]n[^\n]{0,300}?(?:nro|n°|nº|no(?:\.)?|numero|num(?:\.)?|#)?\s*[:\-]?\s*([a-z0-9][a-z0-9\-\.\/]{4,})"
     for m in re.finditer(pat_main, norm):
         candidates.append(m.group(1))
 
@@ -481,13 +497,42 @@ def find_resolution_general(text: str) -> str | None:
     for m in re.finditer(pat_abbr, norm):
         candidates.append(m.group(1))
 
-    # Sanitize candidates
+    # Sanitize candidates (prefer tokens with digits)
     for cand in candidates:
         c = re.sub(r"[ ]+", "", cand)
         c = c.upper().replace("/", "-").replace("\\", "-").replace(":", "-")
         c = re.sub(r"[^A-Z0-9\-.]", "", c).strip(".-")
-        if len(re.sub(r"[^A-Z0-9]", "", c)) >= 5:
+        alnum_len = len(re.sub(r"[^A-Z0-9]", "", c))
+        digit_len = len(re.sub(r"[^0-9]", "", c))
+        if alnum_len >= 5 and digit_len >= 5:
             return c
+
+    # Fallback 1: buscar dígitos largos cerca de la palabra "Resolución" / "Res."
+    candidate_near: str | None = None
+    for m in re.finditer(r"(?i)resoluci[oó]n|\bres\.", norm):
+        seg_after = norm[m.end(): m.end() + 240]
+        m_digits = re.search(r"([0-9][0-9\s\-\.]{11,})", seg_after)
+        if m_digits:
+            digits = re.sub(r"\D", "", m_digits.group(1))
+            if len(digits) >= 12:
+                if digits.startswith("20"):
+                    return digits
+                candidate_near = candidate_near or digits
+    if candidate_near:
+        return candidate_near
+
+    # Fallback 2: cualquier número largo (>=12 dígitos) en la página
+    all_digits = re.findall(r"\d{12,}", norm)
+    if all_digits:
+        # Preferir los que empiezan por '20' (p. ej., año de resolución)
+        prefer = [d for d in all_digits if d.startswith("20")]
+        if prefer:
+            longest = max(prefer, key=len)
+            return longest
+        # Si no hay preferidos, elegir el más largo como heurística
+        longest = max(all_digits, key=len)
+        return longest
+
     return None
 
 
@@ -665,6 +710,7 @@ def process_prefix_rename(
     min_score: float = 0.0,
     out_dir: str | None = None,
     allow_fallback: bool = False,
+    only_file: str | None = None,
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """
     Renombra PDFs en el MISMO directorio según prefijos basados EXCLUSIVAMENTE en la primera página.
@@ -695,6 +741,15 @@ def process_prefix_rename(
     renamed: list[tuple[str, str]] = []
     skipped: list[tuple[str, str]] = []
     pdf_files = [f for f in os.listdir(dir_path) if f.lower().endswith(".pdf")]
+    # Si se especifica un archivo único, limitar el procesamiento a ese archivo
+    if only_file:
+        only_basename = os.path.basename(only_file)
+        candidate = os.path.join(dir_path, only_basename)
+        if os.path.isfile(candidate) and only_basename.lower().endswith(".pdf"):
+            pdf_files = [only_basename]
+        else:
+            print(f"[ERROR] El archivo especificado no existe en el directorio o no es PDF: {candidate}")
+            return [], [(candidate, "archivo_no_encontrado")]
     if not pdf_files:
         print("[AVISO] No se encontraron archivos PDF en el directorio.")
 
@@ -842,6 +897,9 @@ def process_prefix_rename(
         has_ap = re.search(r"acuerdo\s+de\s+pago(?:\s+de\s+impuesto)?", norm)
         if has_ap:
             res_ap = find_resolution_acuerdo_pago(page_text)
+            if not res_ap:
+                # Fallback: resolución general en la página (p. ej., encabezados con 'Resolución No.')
+                res_ap = find_resolution_general(page_text)
             if res_ap:
                 new_name = f"AP {res_ap}.pdf"
                 dst_path = ensure_unique_path(target_dir, new_name)
@@ -1004,7 +1062,26 @@ if __name__ == "__main__":
             else:
                 print("[ERROR] Debes proporcionar --pdf o --dir. No se encontró carpeta 'docs' en el directorio actual.")
                 sys.exit(1)
-        if getattr(args, "prefix_rename", False) and args.dir:
+        # Nuevo: permitir renombrar por prefijos para un solo archivo usando --pdf
+        if getattr(args, "prefix_rename", False) and args.pdf:
+            single_dir = os.path.dirname(args.pdf) or os.getcwd()
+            renamed, skipped = process_prefix_rename(
+                dir_path=single_dir,
+                lang=args.lang,
+                dpi=args.dpi,
+                min_score=args.min_score,
+                out_dir=args.prefix_out_dir,
+                allow_fallback=args.allow_fallback,
+                only_file=args.pdf,
+            )
+            print("\n===== Resumen (Prefijos-Renombrar) =====")
+            print(f"Renombrados ({len(renamed)}):")
+            for src, dst in renamed:
+                print(f" - {os.path.basename(src)} -> {os.path.basename(dst)}")
+            print(f"Omitidos ({len(skipped)}):")
+            for src, motivo in skipped:
+                print(f" - {os.path.basename(src)} ({motivo})")
+        elif getattr(args, "prefix_rename", False) and args.dir:
             renamed, skipped = process_prefix_rename(
                 dir_path=args.dir,
                 lang=args.lang,
