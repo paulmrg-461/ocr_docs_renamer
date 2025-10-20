@@ -2,3 +2,4 @@ paddlepaddle
 paddleocr
 pymupdf
 opencv-python
+pyqt5

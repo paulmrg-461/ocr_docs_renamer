@@ -22,6 +22,13 @@ python -m venv .venv
 ```
 pip install -r requirements.txt
 ```
+3) Run the script:
+```
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python ocr_gui.py
+```
 
 ## Usage
 There are two modes: single PDF and directory processing.
