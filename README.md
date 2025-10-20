@@ -25,7 +25,7 @@ pip install -r requirements.txt
 3) Run the script:
 ```
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\activate
 pip install -r requirements.txt
 python ocr_gui.py
 ```

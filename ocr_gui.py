@@ -118,7 +118,7 @@ class MainWindow(QMainWindow):
         params_layout.addWidget(self.mode_prefijos_btn)
         # Idioma
         params_layout.addWidget(QLabel("Idioma:"))
-        self.lang_edit = QLineEdit("latin")
+        self.lang_edit = QLineEdit("es")
         self.lang_edit.setFixedWidth(100)
         params_layout.addWidget(self.lang_edit)
         # DPI
