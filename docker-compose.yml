@@ -1,0 +1,27 @@
+version: "3.8"
+services:
+  ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ocr_docs_renamer_gpu
+    # Solicitar acceso a GPUs (requiere Docker con soporte GPU y NVIDIA Container Toolkit)
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      # Parámetros por defecto (puedes cambiarlos aquí o en la command)
+      - DPI=300
+      - MIN_SCORE=0.80
+      - LANG=es
+    volumes:
+      # Mapea tu carpeta local con PDFs al contenedor
+      - ./docs:/data/docs
+      # Opcional: persistir modelos de PaddleOCR para no re-descargar en cada build
+      - ocr_models:/root/.paddleocr
+    working_dir: /app
+    # Comando ejemplo: renombrado por prefijos en /data/docs
+    command: ["python", "ocr_pdf.py", "--prefix-rename", "--dir", "/data/docs", "--lang", "${LANG}", "--dpi", "${DPI}", "--min-score", "${MIN_SCORE}"]
+
+volumes:
+  ocr_models:
